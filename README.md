@@ -1,5 +1,7 @@
 ## react-codemod [![Build Status](https://travis-ci.org/reactjs/react-codemod.svg)](https://travis-ci.org/reactjs/react-codemod)
 
+React-codemod's class.js output has class static properties which are stage-3. This fork is transforming classes to babel in env preset.
+
 This repository contains a collection of codemod scripts for use with
 [JSCodeshift](https://github.com/facebook/jscodeshift) that help update React
 APIs.

@@ -119,9 +119,9 @@ module.exports = (file, api, options) => {
   };
 
   const isPrimExpression = node => (
-    node.type === 'Literal' || ( // NOTE this might change in babylon v6
-      node.type === 'Identifier' &&
-      node.name === 'undefined'
+  node.type === 'Literal' || ( // NOTE this might change in babylon v6
+    node.type === 'Identifier' &&
+    node.name === 'undefined'
   ));
 
   const isFunctionExpression = node => (
@@ -175,13 +175,13 @@ module.exports = (file, api, options) => {
   // ---------------------------------------------------------------------------
   // Checks if the module uses mixins or accesses deprecated APIs.
   const checkDeprecatedAPICalls = classPath =>
-    DEPRECATED_APIS.reduce(
-      (acc, name) =>
-        acc + j(classPath)
-          .find(j.Identifier, {name})
-          .size(),
-      0
-    ) > 0;
+  DEPRECATED_APIS.reduce(
+    (acc, name) =>
+    acc + j(classPath)
+      .find(j.Identifier, {name})
+      .size(),
+    0
+  ) > 0;
 
   const hasNoCallsToDeprecatedAPIs = classPath => {
     if (checkDeprecatedAPICalls(classPath)) {
@@ -390,6 +390,9 @@ module.exports = (file, api, options) => {
     return result;
   };
 
+  const collectFunctions = specPath => specPath.properties
+    .filter(isFunctionExpression);
+
   const collectNonStaticProperties = specPath => specPath.properties
     .filter(prop =>
       !(filterDefaultPropsField(prop) || filterGetInitialStateField(prop))
@@ -401,6 +404,63 @@ module.exports = (file, api, options) => {
       isPrimProperty(prop)
     );
 
+  const findAutobindNamesFor = (subtree, fnNames, literalOrIdentifier) => {
+    const node = literalOrIdentifier;
+    const autobindNames = {};
+
+    j(subtree)
+      .find(j.MemberExpression, {
+        object: node.name ? {
+          type: node.type,
+          name: node.name,
+        } : {type: node.type},
+        property: {
+          type: 'Identifier',
+        },
+      })
+      .filter(path => path.value.property && fnNames[path.value.property.name])
+      .filter(path => {
+        const call = path.parent.value;
+        return !(
+          call &&
+          call.type === 'CallExpression' &&
+          call.callee.type === 'MemberExpression' &&
+          call.callee.object.type === node.type &&
+          call.callee.object.name === node.name &&
+          call.callee.property.type === 'Identifier' &&
+          call.callee.property.name === path.value.property.name
+        );
+      })
+      .forEach(path => autobindNames[path.value.property.name] = true);
+
+    return Object.keys(autobindNames);
+  };
+
+  const collectAutoBindFunctions = (functions, classPath) => {
+    const fnNames = {};
+    functions
+      .filter(fn => !AUTOBIND_IGNORE_KEYS[fn.key.name])
+      .forEach(fn => fnNames[fn.key.name] = true);
+    const autobindNames = {};
+    const add = name => autobindNames[name] = true;
+    // Find `this.<foo>`
+    findAutobindNamesFor(classPath, fnNames, j.thisExpression()).forEach(add);
+    // Find `self.<foo>` if `self = this`
+    j(classPath)
+      .findVariableDeclarators()
+      .filter(path => (
+        path.value.id.type === 'Identifier' && -path.value.init &&
+        path.value.init.type === 'ThisExpression'
+      ))
+      .forEach(path =>
+        findAutobindNamesFor(
+          j(path).closest(j.FunctionExpression).get(),
+          fnNames,
+          path.value.id
+        ).forEach(add)
+      );
+    return Object.keys(autobindNames).sort();
+  };
   const findRequirePathAndBinding = (moduleName) => {
     let result = null;
     const requireCall = root.find(j.VariableDeclarator, {
@@ -448,6 +508,30 @@ module.exports = (file, api, options) => {
       fn.key,
       fn.value
     ), fn);
+
+  const createBindAssignment = name =>
+    j.expressionStatement(
+      j.assignmentExpression(
+        '=',
+        j.memberExpression(
+          j.thisExpression(),
+          j.identifier(name),
+          false
+        ),
+        j.callExpression(
+          j.memberExpression(
+            j.memberExpression(
+              j.thisExpression(),
+              j.identifier(name),
+              false
+            ),
+            j.identifier('bind'),
+            false
+          ),
+          [j.thisExpression()]
+        )
+      )
+    );
 
   const updatePropsAndContextAccess = getInitialState => {
     const collection = j(getInitialState);
@@ -548,29 +632,31 @@ module.exports = (file, api, options) => {
     return [j.identifier('props')];
   };
 
-  const createConstructor = (getInitialState) => {
-    const initialStateAST = j(getInitialState);
+  const createConstructor = (getInitialState, autobindFunctions) => {
     let hasContextAccess = false;
+    if (getInitialState) {
+      const initialStateAST = j(getInitialState);
 
-    if (
-      initialStateAST.find(j.MemberExpression, { // has `this.context` access
-        object: {type: 'ThisExpression'},
-        property: {type: 'Identifier', name: 'context'},
-      }).size() ||
-      initialStateAST.find(j.CallExpression, { // a direct method call `this.x()`
-        callee: {
-          type: 'MemberExpression',
+      if (
+        initialStateAST.find(j.MemberExpression, { // has `this.context` access
           object: {type: 'ThisExpression'},
-        },
-      }).size() ||
-      initialStateAST.find(j.MemberExpression, { // `this` is referenced alone
-        object: {type: 'ThisExpression'},
-      }).size() !== initialStateAST.find(j.ThisExpression).size()
-    ) {
-      hasContextAccess = true;
+          property: {type: 'Identifier', name: 'context'},
+        }).size() ||
+        initialStateAST.find(j.CallExpression, { // a direct method call `this.x()`
+          callee: {
+            type: 'MemberExpression',
+            object: {type: 'ThisExpression'},
+          },
+        }).size() ||
+        initialStateAST.find(j.MemberExpression, { // `this` is referenced alone
+          object: {type: 'ThisExpression'},
+        }).size() !== initialStateAST.find(j.ThisExpression).size()
+      ) {
+        hasContextAccess = true;
+      }
+      updatePropsAndContextAccess(getInitialState);
     }
 
-    updatePropsAndContextAccess(getInitialState);
     const constructorArgs = createConstructorArgs(hasContextAccess);
 
     return [
@@ -589,7 +675,8 @@ module.exports = (file, api, options) => {
                   )
                 ),
               ],
-              inlineGetInitialState(getInitialState)
+              autobindFunctions.map(createBindAssignment),
+              getInitialState ? inlineGetInitialState(getInitialState): []
             )
           )
         ),
@@ -713,9 +800,9 @@ module.exports = (file, api, options) => {
     let typeResult = flowFixMeType;
 
     if ( // check `.isRequired` first
-      cursor.type === 'MemberExpression' &&
-      cursor.property.type === 'Identifier' &&
-      cursor.property.name === 'isRequired'
+    cursor.type === 'MemberExpression' &&
+    cursor.property.type === 'Identifier' &&
+    cursor.property.name === 'isRequired'
     ) {
       isOptional = false;
       cursor = cursor.object;
@@ -875,22 +962,22 @@ module.exports = (file, api, options) => {
     const initialStateCollection = j(initialStateProperty);
     const thisCount = initialStateCollection.find(j.ThisExpression).size();
     const safeThisMemberCount = initialStateCollection.find(j.MemberExpression, {
-      object: {
-        type: 'ThisExpression',
-      },
-      property: {
-        type: 'Identifier',
-        name: 'props',
-      },
-    }).size() + initialStateCollection.find(j.MemberExpression, {
-      object: {
-        type: 'ThisExpression',
-      },
-      property: {
-        type: 'Identifier',
-        name: 'context',
-      },
-    }).size();
+        object: {
+          type: 'ThisExpression',
+        },
+        property: {
+          type: 'Identifier',
+          name: 'props',
+        },
+      }).size() + initialStateCollection.find(j.MemberExpression, {
+        object: {
+          type: 'ThisExpression',
+        },
+        property: {
+          type: 'Identifier',
+          name: 'context',
+        },
+      }).size();
 
     if (thisCount === safeThisMemberCount) {
       return initialStateProperty.concat(propertiesAndMethods);
@@ -922,6 +1009,7 @@ module.exports = (file, api, options) => {
     baseClassName,
     staticProperties,
     getInitialState,
+    autobindFunctions,
     rawProperties,
     comments
   ) => {
@@ -929,12 +1017,8 @@ module.exports = (file, api, options) => {
     let maybeConstructor = [];
     let maybeFlowStateAnnotation = []; // we only need this when we do `this.state = ...`
 
-    if (isInitialStateLiftable(getInitialState)) {
-      if (getInitialState) {
-        initialStateProperty.push(convertInitialStateToClassProperty(getInitialState));
-      }
-    } else {
-      maybeConstructor = createConstructor(getInitialState);
+    if (getInitialState || autobindFunctions) {
+      maybeConstructor = createConstructor(getInitialState, autobindFunctions);
       if (shouldTransformFlow) {
         let stateType = j.typeAnnotation(
           j.existsTypeAnnotation()
@@ -962,7 +1046,8 @@ module.exports = (file, api, options) => {
         return createMethodDefinition(prop);
       }
 
-      return createArrowProperty(prop);
+      //return createArrowProperty(prop);
+      return createMethodDefinition(prop);
     });
 
     const flowPropsAnnotation = shouldTransformFlow ?
@@ -995,6 +1080,22 @@ module.exports = (file, api, options) => {
       )
     ), {comments});
   };
+
+  const createStaticAssignment = (name, staticProperty) =>
+    withComments(j.expressionStatement(
+      j.assignmentExpression(
+        '=',
+        j.memberExpression(
+          name,
+          j.identifier(staticProperty.key.name),
+          false
+        ),
+        staticProperty.value
+      )
+    ), staticProperty);
+
+  const createStaticAssignmentExpressions = (name, statics) =>
+    statics.map(staticProperty => createStaticAssignment(name, staticProperty));
 
   const createStaticClassProperty = staticProperty => {
     if (staticProperty.value.type === 'FunctionExpression') {
@@ -1037,6 +1138,12 @@ module.exports = (file, api, options) => {
     return null;
   };
 
+  const createModuleExportsMemberExpression = () =>
+    j.memberExpression(
+      j.identifier('module'),
+      j.identifier('exports'),
+      false
+    );
   const findUnusedVariables = (path, varName) => j(path)
     .closestScope()
     .find(j.Identifier, {name: varName})
@@ -1060,13 +1167,16 @@ module.exports = (file, api, options) => {
     const specPath = ReactUtils.directlyGetCreateClassSpec(classPath);
     const name = ReactUtils.directlyGetComponentName(classPath);
     const statics = collectStatics(specPath);
+    const functions = collectFunctions(specPath);
     const properties = collectNonStaticProperties(specPath);
     const comments = getComments(classPath);
 
+    const autobindFunctions = collectAutoBindFunctions(functions, classPath);
     const getInitialState = findGetInitialState(specPath);
+    const staticName = createModuleExportsMemberExpression();
 
     var path = classPath;
-
+    var addExport = false;
     if (
       classPath.parentPath &&
       classPath.parentPath.value &&
@@ -1080,9 +1190,12 @@ module.exports = (file, api, options) => {
       // it's actually safe.
       // (VariableDeclaration > declarations > VariableDeclarator > CallExpression)
       path = classPath.parentPath.parentPath.parentPath;
+      if (path.parentPath && path.parentPath.value && path.parentPath.value.type === 'ExportNamedDeclaration' ) {
+        path = path.parentPath;
+        addExport = true;
+      }
     }
 
-    const staticProperties = createStaticClassProperties(statics);
     const baseClassName =
       pureRenderMixinPathAndBinding &&
       ReactUtils.directlyHasSpecificMixins(classPath, [pureRenderMixinPathAndBinding.binding]) ?
@@ -1093,12 +1206,34 @@ module.exports = (file, api, options) => {
       createESClass(
         name,
         baseClassName,
-        staticProperties,
+        [],
         getInitialState,
+        autobindFunctions,
         properties,
         comments
       )
     );
+
+    const staticAssignments = createStaticAssignmentExpressions(
+      j.identifier(name),
+      statics
+    );
+
+    root.get().value.program.body.push(...staticAssignments);
+
+    if (addExport) {
+      root.get().value.program.body.push(j.expressionStatement(
+        j.assignmentExpression(
+          '=',
+          j.memberExpression(
+            j.identifier('exports'),
+            j.identifier(name),
+            false
+          ),
+          j.identifier(name)
+        ))
+      );
+    }
   };
 
   const addDisplayName = (displayName, specPath) => {
@@ -1160,8 +1295,8 @@ module.exports = (file, api, options) => {
     withComments(
       j(classPath).replaceWith(
         specPath
-         ? j.callExpression(j.identifier(CREATE_CLASS_VARIABLE_NAME), [specPath])
-         : j.callExpression(j.identifier(CREATE_CLASS_VARIABLE_NAME), classPath.value.arguments)
+          ? j.callExpression(j.identifier(CREATE_CLASS_VARIABLE_NAME), [specPath])
+          : j.callExpression(j.identifier(CREATE_CLASS_VARIABLE_NAME), classPath.value.arguments)
       ),
       {comments}
     );
